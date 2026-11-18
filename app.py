@@ -538,6 +538,86 @@ def is_user_online(name):
     last_seen = ONLINE_USERS.get(name, 0)
     return (time.time() - last_seen) < ONLINE_THRESHOLD
 
+# وضعیت سلامت هسته (برای /api/diag و پیام‌های استارتاپ)
+XHTTP_AVAILABLE = True
+XRAY_CONFIG_OK = True
+XRAY_CONFIG_ERROR = ""
+Nginx = None  # (بی‌استفاده؛ فقط برای جلوگیری از نام‌های تکراری)
+
+
+def xray_bin_path():
+    """مسیر باینری Xray. اولویت: env → مسیر استاندارد ایمیج → PATH."""
+    env = (os.environ.get("VEGA_XRAY_BIN") or "").strip()
+    if env:
+        return env
+    for candidate in ("/usr/local/bin/xray/xray", "/usr/bin/xray", "xray"):
+        if candidate == "xray":
+            found = shutil.which("xray")
+            return found or "xray"
+        if os.path.exists(candidate):
+            return candidate
+    return "xray"
+
+
+def xray_version():
+    """نسخهٔ Xray به‌صورت رشته؛ '' اگر اجرا نشود."""
+    try:
+        r = subprocess.run([xray_bin_path(), "-version"], capture_output=True, text=True, timeout=10)
+        first = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
+        return first[0] if first else ""
+    except Exception:
+        return ""
+
+
+def _xray_config_test():
+    """(ok, خروجی) از `xray run -test`."""
+    try:
+        r = subprocess.run([xray_bin_path(), "run", "-test", "-c", XRAY_CONFIG_PATH],
+                           capture_output=True, text=True, timeout=30)
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        return r.returncode == 0, out
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def validate_xray_config():
+    """کانفیگ را قبل از اجرا چک می‌کند و در صورت پشتیبانی‌نشدن XHTTP، آن را حذف می‌کند.
+
+    اگر باینری Xray قدیمی باشد (بدون ترنسپورت xhttp) کل کانفیگ رد می‌شود و
+    هسته بالا نمی‌آید؛ این تابع جلوی آن را می‌گیرد تا ۷ کانفیگ دیگر سالم بمانند.
+    """
+    global XHTTP_AVAILABLE, XRAY_CONFIG_OK, XRAY_CONFIG_ERROR
+
+    ok, out = _xray_config_test()
+    if ok:
+        XHTTP_AVAILABLE, XRAY_CONFIG_OK, XRAY_CONFIG_ERROR = True, True, ""
+        return True
+
+    XRAY_CONFIG_ERROR = out[-900:]
+    print(f"[vega] ⚠ Xray config نامعتبر است:\n{out[-600:]}", flush=True)
+
+    # تلاش نجات: حذف inbound XHTTP و تست دوباره
+    if XHTTP_AVAILABLE:
+        try:
+            cfg = json.load(open(XRAY_CONFIG_PATH, encoding="utf-8"))
+            cfg["inbounds"] = [i for i in cfg["inbounds"] if i.get("tag") != "vless-xhttp-in"]
+            with open(XRAY_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+            ok2, out2 = _xray_config_test()
+            if ok2:
+                XHTTP_AVAILABLE, XRAY_CONFIG_OK, XRAY_CONFIG_ERROR = False, True, ""
+                print("[vega] ⚠ XHTTP غیرفعال شد (نسخهٔ Xray از ترنسپورت xhttp پشتیبانی نمی‌کند) "
+                      "→ ۷ کانفیگ دیگر فعال‌اند. ایمیج را با Xray v25+ بساز.", flush=True)
+                return True
+            XRAY_CONFIG_ERROR = out2[-900:]
+        except Exception as e:
+            XRAY_CONFIG_ERROR = f"{type(e).__name__}: {e}"
+
+    XRAY_CONFIG_OK = False
+    print(f"[vega] ✗ Xray با این کانفیگ بالا نمی‌آید: {XRAY_CONFIG_ERROR[-300:]}", flush=True)
+    return False
+
+
 def build_xray_config():
     users = get_all_users()
 
@@ -681,6 +761,9 @@ def build_xray_config():
 
     with open(XRAY_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
+
+    validate_xray_config()
+
 
 def restart_xray():
     build_xray_config()
@@ -1145,6 +1228,7 @@ def make_all_configs(user, host, port=443, tls=True, ascii_names=False):
         (3, "VLESS · ED2048", "vless",
          {"port": port, "path": f"{VLESS_PATH}?ed=2048", "fp": "safari"}),
         # ترنسپورت XHTTP روی همان دامنه (inbound چهارم) — مسیرش هم مبهم و مخصوص این نصب است
+        # اگر هستهٔ Xray قدیمی باشد و xhttp را نشناسد، این مورد از فهرست حذف می‌شود
         (4, "VLESS · XHTTP", "vless",
          {"port": port, "path": XHTTP_PATH, "fp": "chrome", "transport": "xhttp", "mode": XHTTP_MODE}),
         (5, "TROJAN · WS", "trojan",
@@ -1166,6 +1250,9 @@ def make_all_configs(user, host, port=443, tls=True, ascii_names=False):
 
     configs = []
     for number, tag, kind, p in plan:
+        # اگر هستهٔ Xray قدیمی باشد و ترنسپورت xhttp را نشناسد، این کانفیگ ساخته نمی‌شود
+        if p.get("transport") == "xhttp" and not XHTTP_AVAILABLE:
+            continue
         text = remark(number)
         # اثر انگشت (fp) فقط در حالت TLS معنا دارد
         alpn = None
@@ -1499,6 +1586,57 @@ def healthz():
         "nginx_bin": shutil.which("nginx") or "",
         "skin": SKIN_CSS,
         "obfuscated_paths": True,
+    })
+
+
+@app.route("/api/diag")
+def api_diag():
+    """خودبررسی کامل: هسته، کانفیگ، پورت‌ها، nginx. فقط برای نشستِ لاگین‌شده."""
+    if not session.get("admin"):
+        return jsonify({"error": "auth"}), 401
+
+    ports = {
+        "vless": _port_open(XRAY_PORT),
+        "trojan": _port_open(TROJAN_PORT),
+        "vmess": _port_open(VMESS_PORT),
+        "xhttp": _port_open(XHTTP_PORT),
+        "api": _port_open(XRAY_API_PORT),
+        "flask": _port_open(FLASK_PORT),
+        "public": _port_open(PUBLIC_PORT),
+    }
+    nginx_bin = shutil.which("nginx") or ""
+    nginx_test = ""
+    if nginx_bin and os.path.exists(NGINX_CONFIG_PATH):
+        try:
+            r = subprocess.run([nginx_bin, "-t", "-c", os.path.abspath(NGINX_CONFIG_PATH)],
+                               capture_output=True, text=True, timeout=20)
+            nginx_test = ((r.stdout or "") + (r.stderr or "")).strip()[-300:]
+        except Exception as e:
+            nginx_test = f"{type(e).__name__}: {e}"
+
+    ver = xray_version()
+    hinted = ""
+    if ver and not XHTTP_AVAILABLE:
+        hinted = "نسخهٔ Xray از xhttp پشتیبانی نمی‌کند → کانفیگ ۴ حذف شده؛ ایمیج را با v25+ بساز"
+    if not XRAY_CONFIG_OK:
+        hinted = "Xray با کانفیگ فعلی بالا نمی‌آید (جزئیات در config_error)"
+
+    return jsonify({
+        "xray_version": ver,
+        "xray_bin": xray_bin_path(),
+        "config_ok": XRAY_CONFIG_OK,
+        "config_error": XRAY_CONFIG_ERROR[-600:],
+        "xhttp_available": XHTTP_AVAILABLE,
+        "configs": len(make_all_configs({"uuid": "00000000-0000-0000-0000-000000000000",
+                                         "name": "diag"}, "127.0.0.1", 443, True)),
+        "ports_listening": ports,
+        "nginx_bin": nginx_bin,
+        "nginx_test": nginx_test,
+        "public_port": PUBLIC_PORT,
+        "platform_port": PLATFORM_PORT,
+        "paths": {"vless": VLESS_PATH, "trojan": TROJAN_PATH,
+                  "vmess": VMESS_PATH, "xhttp": XHTTP_PATH, "sub": SUB_PREFIX},
+        "hint": hinted,
     })
 
 
